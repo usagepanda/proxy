@@ -1,0 +1,44 @@
+# This workflow ZIPs the package, uploads to S3, and updates the Lambda function
+name: Deploy to AWS
+on:
+  push:
+    branches:
+      - "main"
+env:
+  BUCKET_NAME : ${{ secrets.S3_BUCKET_NAME }}
+  AWS_REGION : "us-east-1"
+# permission can be added at job level or workflow level    
+permissions:
+      id-token: write   # This is required for requesting the JWT
+      contents: read    # This is required for actions/checkout
+jobs:
+  S3PackageUpload:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Git Clone the Repository
+        uses: actions/checkout@v3
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOYER_ROLE }}
+          role-session-name: GitHubActionsSession
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Setup Node.js
+        uses: actions/setup-node@v2
+        with:
+          node-version: '18.12.0'
+      - name: Install Dependencies
+        run: |
+          npm install
+      - name: Run Tests
+        run: |
+          npm test
+      - name: Prune Dependencies
+        run: |
+          npm prune --production
+      - name:  Upload and Deploy ZIP
+        run: |
+          zip -r deployment.zip . -x "*.git*" -x "*.md" -x "__tests__/*" -x "node_modules/aws-sdk/*" -x "scripts/*" -x ".env*" -x "README.md" -x "jest.config.js" -q
+          export ZIP_NAME=$(date +%Y%m%d%H%M%S).zip
+          aws s3 cp ./deployment.zip s3://${{ env.BUCKET_NAME }}/functions/$ZIP_NAME
+          aws lambda update-function-code --function-name usage-panda-proxy-prod --s3-bucket ${{ env.BUCKET_NAME }} --s3-key functions/$ZIP_NAME --publish > /dev/null

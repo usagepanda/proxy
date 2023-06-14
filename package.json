@@ -1,0 +1,24 @@
+{
+  "name": "usage-panda-proxy",
+  "version": "1.0.0",
+  "description": "Proxy for OpenAI with security and governance features",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "test": "node --experimental-vm-modules ./node_modules/.bin/jest --forceExit"
+  },
+  "keywords": [
+    "llm",
+    "openai",
+    "proxy",
+    "security"
+  ],
+  "author": "Usage Panda",
+  "license": "GNU Affero GPL 3.0",
+  "dependencies": {
+    "got": "^12.6.0"
+  },
+  "devDependencies": {
+    "jest": "^29.5.0"
+  }
+}
