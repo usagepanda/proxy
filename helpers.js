@@ -134,6 +134,19 @@ const helpers = {
             return {headerError: this.rtnError(403, 'access_denied', 'No API keys found in headers')};
         }
 
+
+        const customAuth = proxyConfig.CUSTOM_AUTH_HANDLER(event.headers['authorization'])
+        if (customAuth){
+            // We're authenticating the request with our custom function
+            // We are assuming the openAIKey and usagePandaKey are provided or default
+            return {
+                openAIKey: `Bearer ${customAuth.openAIKey || proxyConfig.OPENAI_API_KEY}`,
+                usagePandaKey: (customAuth.usagePandaKey || proxyConfig.USAGE_PANDA_API_KEY),
+                customAuth
+            };
+        }
+        
+
         // Extract the Usage Panda key from the auth header or config
         const usagePandaKey = event.headers['x-usagepanda-api-key'] || proxyConfig.USAGE_PANDA_API_KEY;
         if (!proxyConfig.LOCAL_MODE &&

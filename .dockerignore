@@ -4,3 +4,4 @@ node_modules
 deployment.zip
 __tests__/
 README.md
+.devcontainer/
