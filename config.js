@@ -123,7 +123,6 @@ export default {
     // Masking provides pseudonymous data to Usage Panda by hashing the field with the PROXY_ID.
     MASK_USER_FIELD: false,
 
-
     // Select the request header to use for a unique ID. The default is `x-usagepanda-trace-id`
     // Others might be AWS Clodufront `x-amz-cf-id`, Cloudflare `cf-request-id`
     // This could also be a custom value that you set in your client to track a session
@@ -131,7 +130,7 @@ export default {
 
     // If set to false the proxy actively remove streaming=true from in requests before forwarding.
     // This will disable token streaming from OpenAI. Keep disabled if using Lambda.
-    ALLOW_STREAMING: false,
+    ALLOW_STREAMING: true,
     
     // You can assign a custom authentication handler here, such as checking that the API key exists
     // in a database. This can be used to provide users/apps a unique API key to access the proxy. 
@@ -141,33 +140,33 @@ export default {
     // azure: This will override the default Azure settings for this client or force the client to use Azure if openai is default
     // There may be other overrides that could be useful here.
     CUSTOM_AUTH_HANDLER: function(authHeader){
-        const authKey = authHeader.split(' ')[1]
+        const authKey = (authHeader || '').split(' ')[1]
         const defaultOpenAIKey = process.env['OPENAI_API_KEY']
 
-        // Instead of an array of keys, this could be a database lookup
-        // const keys = {
-        //     "local-apikey": {
-        //         openAIKey: defaultOpenAIKey,
-        //     },
-        //     "local-apikey-custom-openaikey": {
-        //         openAIKey: defaultOpenAIKey,
-        //         usagePandaKey: "up-abcd..."
-        //     },
-        //     "azure-override": {
-        //         openAIKey: 'azurekey',
-        //         usagePandaKey: "up-abcd...",
-        //         azure: {
-        //             resource: "azure-resource-name", // <azure-resource-name>.openai.azure.com
-        //             deployment_map: {"gpt-3.5-turbo": "gpt-35-custom-deployment"} // see AZURE_DEPLOYMENT_MAP
-        //         }
-        //     },
-        // }
+        // Instead of a hard coded object, this could be a database lookup
+        const keys = {
+            "local-apikey": {
+                openAIKey: defaultOpenAIKey,
+            },
+            "local-apikey-custom-openaikey": {
+                openAIKey: defaultOpenAIKey,
+                usagePandaKey: "up-abcd..."
+            },
+            "azure-override": {
+                openAIKey: 'azurekey',
+                usagePandaKey: "up-abcd...",
+                azure: {
+                    resource: "azure-resource-name", // <azure-resource-name>.openai.azure.com
+                    deployment_map: {"gpt-3.5-turbo": "gpt-35-custom-deployment"} // see AZURE_DEPLOYMENT_MAP
+                }
+            },
+        }
 
-        // if (keys[authKey]){
-        //     return keys[authKey]
-        // }
+        if (keys[authKey]){
+            return keys[authKey]
+        }
 
-        // Returning false will fail over to env vars or client sent headers
+        // Returning false will fail over to env vars or client headers
         return false
     }
 };

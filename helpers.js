@@ -296,6 +296,37 @@ const helpers = {
         }
     },
 
+    // Make request to upstream LLM with streaming enabled
+    makeLLMStreamRequest: async function*(method, url, options) {
+        let statusCode;
+        let headers;
+        try {
+            const stream = got.stream[method](url, options); // use got.stream for server-sent events
+
+            // Grab response headers from the LLM. These can contain useful details like rate limit headers.
+            stream.on('response', (response) => {
+                statusCode = response.statusCode; // save status code when response is received
+                headers = response.headers; // save headers when response is received
+            });
+
+            for await (const chunk of stream) { // Iterate over chunks of data from stream
+                yield {
+                    statusCode: statusCode,
+                    headers: headers,
+                    body: chunk.toString() // parse each chunk of data 
+                };
+            }
+        } catch (error) {    
+            this.log.error(`Received error while making LLM API Streaming request`);
+            console.log(error)
+            yield { // yield error response
+                statusCode: error.response ? error.response.statusCode : 500,
+                headers: headers || {},
+                body: (error.response && error.response.body) ? JSON.parse(error.response.body) : {}
+            };
+        }
+    },
+
     // Given a wordlist name, load the list, split into an array by lines
     // and then check the input for the presence of any words.
     // If mode is "redact", return a new string with *** replacements
@@ -334,7 +365,24 @@ const helpers = {
         }
 
         return null;
+    },
+
+    // We can include headers from the LLM response, which can contain useful information about the request
+    llmHeadersFilter: function(headers){
+        let acceptedFilters = [
+            /^x-ratelimit/,
+            /^openai/,
+            /^azureml/
+        ]
+
+        // Filter out headers that do not match the accepted filters
+        return Object.fromEntries(
+            Object.entries(headers).filter(([key]) =>
+                acceptedFilters.some((regex) => regex.test(key))
+            )
+        );
     }
+
 };
 
 export default helpers;
