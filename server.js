@@ -64,7 +64,7 @@ app.post('/v1/chat/completions', async (req, res) => {
     const method = req.method.toLowerCase();
     const endpoint = req.url.toLowerCase();
     const url = `${config.LLM_API_BASE_PATH}${endpoint}`;
-    const options = { headers: { 'authorization': openAIKey } };
+    const options = { headers: { 'authorization': openAIKey }, json: req.body };
 
     // If OpenAI Org header was passed in, ensure it is passed to OpenAI
     if (req.headers['openai-organization']) options.headers['OpenAI-Organization'] = req.headers['openai-organization'];
@@ -118,9 +118,9 @@ app.post('/v1/chat/completions', async (req, res) => {
 
     // Check for API conversions (e.g., OpenAI --> PaLM)
     // pc = post-conversion
-    // const convertedReq = converters.request(endpoint, req.headers, req.body, config, stats);
-    // const pcUrl = convertedReq.url || url;
-    // const pcOptions = convertedReq.options || options;
+    const convertedReq = converters.request(endpoint, req.headers, req.body, config, stats);
+    const pcUrl = convertedReq.url || url;
+    const pcOptions = convertedReq.options || options;
 
     helpers.log.debug(`Sending ${method} request to ${pcUrl}`);
     const startTime = new Date();
@@ -264,13 +264,6 @@ app.post('/v1/chat/completions', async (req, res) => {
             stats.error = true;
             stats.response = response.body;
             await uploadStats(stats);
-            if (pResponse) {
-                await uploadStats(stats);
-                return res.status(response.statusCode)
-                .header(response.headers)
-                .send(response.body)
-                .end();
-            }
         }
 
         // Loop through the postprocessors
