@@ -2,3 +2,4 @@ node_modules/
 .DS_Store
 deployment.zip
 .devcontainer/
+config.js
