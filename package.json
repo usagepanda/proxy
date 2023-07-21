@@ -5,7 +5,7 @@
   "type": "module",
   "main": "index.js",
   "scripts": {
-    "install-server": "npm install --no-save express body-parser tiktoken-node @aws-sdk/client-ssm",
+    "stream-install": "npm install --no-save express body-parser tiktoken-node @aws-sdk/client-ssm",
     "server": "node server.js",
     "test": "node --experimental-vm-modules ./node_modules/.bin/jest --forceExit",
     "debug-server": "node --inspect server.js"
@@ -19,8 +19,7 @@
   "author": "Usage Panda",
   "license": "GNU Affero GPL 3.0",
   "dependencies": {
-    "got": "^12.6.0",
-    "tiktoken-node": "^0.0.6"
+    "got": "^12.6.0"
   },
   "devDependencies": {
     "jest": "^29.5.0"
