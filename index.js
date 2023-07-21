@@ -2,6 +2,7 @@ import helpers from './helpers.js';
 import converters from './converters/index.js';
 import preprocessors from './preprocessors/index.js';
 import postprocessors from './postprocessors/index.js';
+import { createHmac } from 'crypto';
 
 export async function handler (event, context) {
     /****************************
@@ -54,6 +55,20 @@ export async function handler (event, context) {
     // TODO: try/catch this
     const body = JSON.parse(event.body);
 
+    // If the user field exists in the body and we have user masking enabled,
+    // pseudonymize it via HMAC so that's it's consistent in logs across this proxy ID.
+    if (config.MASK_USER_FIELD && body['user']) {
+        body['user'] = createHmac('sha256', config.PROXY_ID)
+            .update(body['user'])
+            .digest('hex')
+            .slice(0, 16);
+    }
+
+    // Check if the client sent a streaming field, and disable it if it's not allowed
+    if (body['stream'] && !config.ALLOW_STREAMING) {
+        body['stream'] = false;
+    }
+
     // Define the uploadStats function
     const uploadStats = helpers.uploadStats(method, url, usagePandaKey);
 
@@ -72,7 +87,7 @@ export async function handler (event, context) {
             ip_address: event.requestContext.http.sourceIp,
             user_agent: event.requestContext.http.userAgent,
             organization: event.headers['openai-organization'],
-            trace_id: event.headers['x-usagepanda-trace-id'],
+            trace_id: event.headers[(config.TRACE_HEADER || 'x-usagepanda-trace-id')],
         }
     };
 

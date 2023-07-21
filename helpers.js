@@ -1,11 +1,13 @@
 import got from 'got';
-import { readFileSync } from 'fs'
 import proxyConfig from './config.js';
+import * as AWS from "@aws-sdk/client-ssm";
+import fs from 'fs';
 
 let cache = {};
 
 // Reset cache every N minutes
 setInterval(function(){
+    log.debug('Resetting cache')
     cache = {};
 }, 1000 * 60 * proxyConfig.CONFIG_CACHE_MINUTES);
 
@@ -13,10 +15,14 @@ const helpers = {
     // Basic logging and redaction utilities
     log: {
         debug: function(msg) {
+            if (proxyConfig.DEBUG_MODE == false) return;
+            let stack = new Error().stack;
+            let callerName = stack.split('\n')[2].trim().trim();
             console.debug(JSON.stringify({
                 level: 'debug',
                 proxy_id: proxyConfig.PROXY_ID,
-                message: msg
+                message: msg,
+                caller: callerName
             }));
         },
         info: function(msg) {
@@ -34,10 +40,13 @@ const helpers = {
             }));
         },
         error: function(msg) {
+            let stack = new Error().stack;
+            let callerName = stack.split('\n')[2].trim().split(' ')[1];
             console.error(JSON.stringify({
                 level: 'error',
                 proxy_id: proxyConfig.PROXY_ID,
-                message: msg
+                message: msg,
+                caller: callerName
             }));
         }
     },
@@ -63,10 +72,10 @@ const helpers = {
             headers: proxyConfig.CORS_HEADERS,
             body: {
                 error: {
-                  message: msg,
-                  type: type,
-                  param: null,
-                  code: null
+                    message: msg,
+                    type: type,
+                    param: null,
+                    code: null
                 }
             }
         };
@@ -134,6 +143,19 @@ const helpers = {
             return {headerError: this.rtnError(403, 'access_denied', 'No API keys found in headers')};
         }
 
+
+        const customAuth = proxyConfig.CUSTOM_AUTH_HANDLER(event.headers['authorization'])
+        if (customAuth){
+            // We're authenticating the request with our custom function
+            // We are assuming the openAIKey and usagePandaKey are provided or default
+            return {
+                openAIKey: `Bearer ${customAuth.openAIKey || proxyConfig.OPENAI_API_KEY}`,
+                usagePandaKey: (customAuth.usagePandaKey || proxyConfig.USAGE_PANDA_API_KEY),
+                customAuth
+            };
+        }
+        
+
         // Extract the Usage Panda key from the auth header or config
         const usagePandaKey = event.headers['x-usagepanda-api-key'] || proxyConfig.USAGE_PANDA_API_KEY;
         if (!proxyConfig.LOCAL_MODE &&
@@ -165,11 +187,13 @@ const helpers = {
 
     // Load the config from cache or the Usage Panda API
     loadConfig: async function(usagePandaKey) {
+        this.log.debug("Loading config")
         // If local mode, return an empty config (do not load from Usage Panda)
         if (proxyConfig.LOCAL_MODE) {
             this.log.debug('Local mode enabled; returning default local config');
             return { config: proxyConfig, configLoadedFromCache: true };
         }
+        return { config: proxyConfig, configLoadedFromCache: true };
 
         function mergeAndReturn(config) {
             // Take the cached or queried config, merge it with the local config and return
@@ -180,41 +204,65 @@ const helpers = {
                 ...config
             };
         }
-        
+
         if (cache[usagePandaKey] && cache[usagePandaKey].CACHE_ENABLED) {
-            // Config found in cache
+            // Config found in memory cache
             const config = cache[usagePandaKey];
-            this.log.debug('Found config');
+            this.log.debug('Found config in memory');
             this.log.debug(config);
             return { config: mergeAndReturn(config), configLoadedFromCache: true };
-        } else {
-            this.log.debug('No cache found, or cache disabled');
-            try {
-                const response = await got.get(`${proxyConfig.USAGE_PANDA_API}/proxy`, {
-                    headers: {
-                        'x-usagepanda-key': usagePandaKey
-                    }
-                }).json();
-                
-                // Ensure config is valid
-                if (!response || !response.LLM_API_BASE_PATH) return {
-                    configError: this.rtnError(500, 'server_error', 'Error loading Usage Panda config'),
-                    config: proxyConfig,
-                    configLoadedFromCache: true
-                };
-                
-                if (response.CACHE_ENABLED) cache[usagePandaKey] = response;
+        } else if (proxyConfig.CONFIG_CACHE_TYPE){
+            this.log.debug("trying to load from cache")
+            let cachedConfig = await getConfigCache(usagePandaKey);
+            
+            if(cachedConfig) {
+                log.debug(JSON.stringify(cachedConfig))
+                log.debug(`Loaded configuration from ${proxyConfig.CONFIG_CACHE_TYPE}`)
+                return { config: mergeAndReturn(cachedConfig), configLoadedFromCache: true };
+            }
+        }
+        // No cached config found, let's grab it
+        this.log.debug('No cache found, or cache disabled. Retrieving config.');
+        let retrievedConfig = await this.retrieveConfig(usagePandaKey);
+        if (retrievedConfig.configError) return { configError: retrievedConfig.configError, config: mergeAndReturn(retrievedConfig), configLoadedFromCache: false };
+        return  { config: mergeAndReturn(retrievedConfig), configLoadedFromCache: false }
+    },
+
+    retrieveConfig: async function(usagePandaKey) {
+        try {
+            const response = await got.get(`${proxyConfig.USAGE_PANDA_API}/proxy`, {
+                headers: {
+                    'x-usagepanda-key': usagePandaKey
+                }
+            }).json();
+            
+            // Ensure config is valid
+            if (!response || !response.LLM_API_BASE_PATH) return {
+                configError: this.rtnError(500, 'server_error', 'Error loading Usage Panda config'),
+                config: proxyConfig,
+                configLoadedFromCache: true
+            };
+            
+            if (response.CACHE_ENABLED){
+                cache[usagePandaKey] = response;
+                this.log.debug(proxyConfig.CONFIG_CACHE_TYPE)
                 this.log.debug('Loaded config from Usage Panda API');
                 this.log.debug(response);
-                return { config: mergeAndReturn(response), configLoadedFromCache: false };
-            } catch (error) {
-                this.log.error(error);
-                return {
-                    configError: this.rtnError(500, 'server_error', 'Server error loading Usage Panda config'),
-                    config: proxyConfig,
-                    configLoadedFromCache: true
-                };
+                
+                // Also store in a persistent cache if specified
+                if (proxyConfig.CONFIG_CACHE_TYPE){
+                    this.log.debug(`Storing loadded config in ${proxyConfig.CONFIG_CACHE_TYPE}`);
+                    await storeConfigCache(response, usagePandaKey)
+                }
             }
+            return { config: mergeAndReturn(response), configLoadedFromCache: false };
+        } catch (error) {
+            this.log.error(error);
+            return {
+                configError: this.rtnError(500, 'server_error', 'Server error loading Usage Panda config'),
+                config: proxyConfig,
+                configLoadedFromCache: true
+            };
         }
     },
 
@@ -269,7 +317,10 @@ const helpers = {
             const response = await got[method](url, options);
             return {
                 statusCode: response.statusCode,
-                headers: proxyConfig.CORS_HEADERS,
+                headers: {
+                    ...this.llmHeadersFilter(response.headers),
+                    ...proxyConfig.CORS_HEADERS
+                },
                 body: JSON.parse(response.body)
             };
         } catch (error) {    
@@ -277,7 +328,43 @@ const helpers = {
             this.log.error(error);
             return {
                 statusCode: error.response.statusCode,
-                headers: proxyConfig.CORS_HEADERS,
+                headers: {
+                    ...this.llmHeadersFilter(error.response.headers),
+                    ...proxyConfig.CORS_HEADERS
+                },
+                body: (error.response && error.response.body) ? JSON.parse(error.response.body) : {}
+            };
+        }
+    },
+
+    // Make request to upstream LLM with streaming enabled
+    makeLLMStreamRequest: async function*(method, url, options) {
+        let statusCode;
+        let headers;
+        try {
+            const stream = got.stream[method](url, options); // use got.stream for server-sent events
+
+            // Grab response headers from the LLM. These can contain useful details like rate limit headers.
+            stream.on('response', (response) => {
+                statusCode = response.statusCode; // save status code when response is received
+                headers = response.headers; // save headers when response is received
+            });
+
+            for await (const chunk of stream) { // Iterate over chunks of data from stream
+                yield {
+                    statusCode: statusCode,
+                    headers: {
+                        ...this.llmHeadersFilter(headers),
+                        ...proxyConfig.CORS_HEADERS
+                    },
+                    body: chunk.toString() // parse each chunk of data 
+                };
+            }
+        } catch (error) {
+            this.log.error(`Received error while making LLM API Streaming request`);
+            yield { // yield error response
+                statusCode: error.response ? error.response.statusCode : 500,
+                headers: headers || {},
                 body: (error.response && error.response.body) ? JSON.parse(error.response.body) : {}
             };
         }
@@ -288,7 +375,7 @@ const helpers = {
     // If mode is "redact", return a new string with *** replacements
     // return: {matched, finalString}
     matchesWordlist: function(wordlist, input, customList) {
-        const wordFile = customList ? '' : readFileSync(`./wordlists/${wordlist}.txt`, { encoding: 'utf8', flag: 'r' });
+        const wordFile = customList ? '' : fs.readFileSync(`./wordlists/${wordlist}.txt`, { encoding: 'utf8', flag: 'r' });
         const lines = customList || wordFile.split('\n');
 
         let matches = [];
@@ -321,7 +408,121 @@ const helpers = {
         }
 
         return null;
+    },
+
+    // We can include headers from the LLM response, which can contain useful information about the request
+    llmHeadersFilter: function(headers){
+        let acceptedFilters = [
+            /^x-ratelimit/,
+            /^openai/,
+            /^azureml/
+        ]
+
+        // Filter out headers that do not match the accepted filters
+        return Object.fromEntries(
+            Object.entries(headers).filter(([key]) =>
+                acceptedFilters.some((regex) => regex.test(key))
+            )
+        );
     }
 };
+
+
+// Config cache management
+// This is used to store the config in a central location, mostly useful for the lambda instance.
+const storeConfigCache = async function(cachedConfig, usagePandaKey){
+    const cacheStorage = {
+        ssm: async function(cachedConfig, usagePandaKey) {
+            let ssm = new AWS.SSM();
+            log.debug(`Writing config to ${proxyConfig.CONFIG_CACHE_PATH}/${usagePandaKey}`)
+            const input = { 
+                Name: `${proxyConfig.CONFIG_CACHE_PATH}/${usagePandaKey}`,
+                Description: "Cached usage panda proxy config",
+                Value: JSON.stringify(cachedConfig),
+                Type: "SecureString",
+                Overwrite: true,
+                WithDecryption: true
+            };
+
+            return ssm.putParameter(input, function(err, data){
+                if(err){
+                    log.error('Error storing parameter.');
+                    log.error(err);
+                    return err
+                } else {
+                    log.debug('Parameter stored');
+                    return true
+                }
+            })
+        },
+        file: async function(cachedConfig, usagePandaKey) {
+            // fs.mkdir create directory if it doesn't exist
+            fs.mkdir(proxyConfig.CONFIG_CACHE_PATH, { recursive: true }, (err) => {
+                if (err && err.code == 'EEXIST') {
+                    // ignore the error if the folder already exists
+                    log.debug(`Error creating config cache directory. ${err}`);
+                } else if (err) {
+                    log.error(`Error creating config cache directory. ${err}`);
+                }
+                log.debug(`Created config directory ${proxyConfig.CONFIG_CACHE_PATH}`);
+            });
+            fs.writeFile(`${proxyConfig.CONFIG_CACHE_PATH}/${usagePandaKey}.json`, JSON.stringify(cachedConfig, null, 4), function(err){
+                if(err){
+                    log.error(`Error storing config cache to file. ${err}`);
+                    return err
+                }
+                log.info(`Config written to ${proxyConfig.CONFIG_CACHE_PATH}/${usagePandaKey}.json`);
+                return true
+            });
+        }
+    }
+    return await cacheStorage[proxyConfig.CONFIG_CACHE_TYPE](cachedConfig, usagePandaKey);
+}
+
+const getConfigCache = function(usagePandaKey){
+    const cacheStorage = {
+        ssm: async function(usagePandaKey) {
+            log.debug(`Trying to read cached config from ${proxyConfig.CONFIG_CACHE_TYPE} path: ${proxyConfig.CONFIG_CACHE_PATH}/${usagePandaKey}`);
+            let ssm = new AWS.SSM();
+            let params = {
+                    Name: `${proxyConfig.CONFIG_CACHE_PATH}/${usagePandaKey}`,
+                    WithDecryption: true
+                }
+            let retrieveCache = await ssm.getParameter(params)
+            try {
+                let data = await ssm.getParameter(params);
+                log.debug(`Found config in ${proxyConfig.CONFIG_CACHE_TYPE}`);
+                log.debug(data);
+            } catch (err) {
+                log.error('Error getting parameter: ' + err, err.stack);
+                return false;
+
+            }
+            if(Date.parse(await retrieveCache.Parameter.LastModifiedDate) < (Date.now() - (1000 * 60 * proxyConfig.CONFIG_CACHE_MINUTES))){
+                log.debug(`Config cache is older than ${proxyConfig.CONFIG_CACHE_MINUTES} minutes. Returning false`);
+                return false
+            }
+            return JSON.parse(await retrieveCache.Parameter.Value)
+        },
+        file: async function(usagePandaKey) {
+            this.log.debug(`Trying to read cached config from ${proxyConfig.CONFIG_CACHE_TYPE} path: ${proxyConfig.CONFIG_CACHE_PATH}/${usagePandaKey}.json`);
+            let retrieveCache = fs.readFile(`${proxyConfig.CONFIG_CACHE_PATH}/${usagePandaKey}.json`, 'utf8', function(err, data){
+                if (err && err.code == 'ENOENT') {
+                    return false
+                } else if (err) {
+                    log.error(`Error retrieving config cache from file. ${err}`);
+                    return false
+                } else {
+                    log.debug(`Found config in ${proxyConfig.CONFIG_CACHE_TYPE}`);
+                    return JSON.parse(data)
+                }
+            });
+            return retrieveCache
+        }
+    }
+    return cacheStorage[proxyConfig.CONFIG_CACHE_TYPE](usagePandaKey)
+}
+
+const log = helpers.log
 
 export default helpers;

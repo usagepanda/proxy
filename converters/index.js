@@ -47,7 +47,7 @@ export default {
             }
             
             // Converting to Azure
-            const newRequest = openaitoazure.request[endpoint](azureApiKey, azureResource, azureDeployment, body);
+            const newRequest = openaitoazure.request[endpoint](azureApiKey, azureResource, azureDeployment, body, config.AZURE_API_VERSION);
             if (logRequest && newRequest && newRequest.options && newRequest.options.json) {
                 stats.autorouted.azure_request = newRequest.options.json;
             }
