@@ -1,30 +1,22 @@
-'use strict';
 import express from 'express';
 
-// import * as lambda from './index.js'
 import helpers from './helpers.js';
-import config from './config.js';
 import converters from './converters/index.js';
 import preprocessors from './preprocessors/index.js';
 import postprocessors from './postprocessors/index.js';
 
 import bodyParser  from 'body-parser';
 import tiktoken from 'tiktoken-node';
-import { Readable, Transform } from 'stream'
-
-import { parse } from 'url';
-import { Console } from 'console';
-
+import { Readable } from 'stream'
 
 const app = express();
 const port = process.env.PORT || 9000; 
 
 app.use(bodyParser.json());
 
-app.post('/v1/chat/completions', async (req, res) => {
+app.all(/^\/v1\/.+/, async (req, res) => {
     // There are some helper functions that expect a Lambda event object
-    let event = {};
-    event = {
+    let event = {
         headers: req.headers,
         requestContext: {
             http: {
@@ -36,7 +28,7 @@ app.post('/v1/chat/completions', async (req, res) => {
     }
 
     // Extract the auth and Usage Panda key from the headers
-    const {headerError, openAIKey, usagePandaKey} = helpers.extractHeaders(req);
+    const {headerError, openAIKey, usagePandaKey, customAuth} = helpers.extractHeaders(req);
     if (headerError) res.status(401).json(headerError.body).end();
 
     // Load the config; cache it
@@ -49,7 +41,7 @@ app.post('/v1/chat/completions', async (req, res) => {
         for (corsHeader in config.CORS_HEADERS) {
             res.header(corsHeader, config.CORS_HEADERS[corsHeader]);
         }
-        res.status(processOptions['statusCode']).send(processOptions['body']).end()
+        res.status(processOptions['statusCode'])
     };
 
     helpers.log.debug(`Received new proxy call: ${req.method} ${req.path}`);
@@ -64,7 +56,8 @@ app.post('/v1/chat/completions', async (req, res) => {
     const method = req.method.toLowerCase();
     const endpoint = req.url.toLowerCase();
     const url = `${config.LLM_API_BASE_PATH}${endpoint}`;
-    const options = { headers: { 'authorization': openAIKey }, json: req.body };
+    const options = { headers: { 'authorization': openAIKey }};
+    if (req.method == "POST") options['json'] = req.body;
 
     // If OpenAI Org header was passed in, ensure it is passed to OpenAI
     if (req.headers['openai-organization']) options.headers['OpenAI-Organization'] = req.headers['openai-organization'];
@@ -105,8 +98,22 @@ app.post('/v1/chat/completions', async (req, res) => {
             user_agent: req.headers['user-agent'],
             organization: req.headers['openai-organization'],
             trace_id: req.headers[(config.TRACE_HEADER || 'x-usagepanda-trace-id')],
-        }
+        },
+        request: req.body
     };
+
+
+    // Loop through the preprocessors
+    for (let p = 0; p < preprocessors.length; p++) {
+        const processor = preprocessors[p];
+        const value = helpers.extractHeaderConfig(event.headers, config, processor);
+        const pResponse = await processor.run(value, req.body, config, stats, options);
+        if (pResponse) {
+            helpers.log.debug(`Received preprocessor response for ${processor.header}. Returning.`);
+            await uploadStats(stats);
+            return pResponse;
+        }
+    }
 
     // Error if flags with error
     if (stats.error) {
@@ -151,20 +158,25 @@ app.post('/v1/chat/completions', async (req, res) => {
             let llmHeaders;
             let incomplete = "";
             for await (const dataStream of helpers.makeLLMStreamRequest(method, pcUrl, pcOptions)) {
+                // Headers need to be sent first, but only once
+                if (!llmHeaders) {
+                    if(dataStream.headers){
+                        llmHeaders = dataStream.headers;
+                        res.set(llmHeaders);
+                    } else {
+                        // If we didn't get headers, we'll just bypass this block
+                        llmHeaders = true;
+                    }
+                }
+
                 if (incomplete) {
                     helpers.log.debug(`Merging ${incomplete} with ${dataStream.body}`)
                     dataStream.body = incomplete + dataStream.body;
                     incomplete = "";
                 }
 
-                // // Include filtered headers from the LLM response
-                if (!llmHeaders && !res.headersSent) {
-                    llmHeaders = helpers.llmHeadersFilter(dataStream.headers);
-                    res.set(llmHeaders);
-                }
-                
-
                 const extractData = (match) => match[1];
+                // helpers.log.debug(dataStream.body)
                 let responseData = Array.from(dataStream.body.matchAll(/^data: (.*)$/mg), extractData);
                 let lastIndex = responseData[responseData.length - 1]
 
@@ -190,7 +202,7 @@ app.post('/v1/chat/completions', async (req, res) => {
                     // Constructing an object that represents a non-streaming OpenAI response
                     meta['id'] = output['id']
                     meta['created'] = output['created']
-                    meta['model'] = output['model']
+                    meta['model'] = req.body['model']
 
                     // There are a number of "finished_reasons"
                     // stop: API returned complete message, or a message terminated by one of the stop sequences provided via the stop parameter
@@ -198,29 +210,30 @@ app.post('/v1/chat/completions', async (req, res) => {
                     // function_call: The model decided to call a function
                     // content_filter: Omitted content due to a flag from our content filters
                     // null: API response still in progress or incomplete
-                    if (choice['finish_reason'] == null){
-                        streamedBody +=  choice['delta']['content'] || '';
-                        meta['choices'][0]['message']['content'] = streamedBody
+                    if (choice['finish_reason'] != null){
+                        meta['choices'][0]['finish_reason'] = choice['finish_reason']
                     }
 
-                    meta['choices'][0]['finish_reason'] = choice['finish_reason']
+                    streamedBody +=  choice['delta']['content'] || '';
+                    meta['choices'][0]['message']['content'] = streamedBody
 
-                    // Since we're streaming, we will incrementally scan the response messages
-                    // for (let p = 0; p < postprocessors.length; p++) {
-                    //     console.log("ASDF")
-                    //     const processor = postprocessors[p];
-                    //     const value = helpers.extractHeaderConfig(event.headers, config, processor);
-                    //     const pResponse = await processor.run(value, body, meta, config, stats);
-                    //     if (pResponse) {
-                    //         console.log("DETECTED")
-                    //         console.log(pResponse)
-                    //         // throw new Error(pResponse);
-                    //         // yield pResponse;
-                    //         // await uploadStats(stats);
-                    //     }
-                    // }
-
+                    
                 }
+
+                // Since we're streaming, we will incrementally scan the response messages
+                // We do it after the latest set of chunks to call it less
+                // If a block is detected, interrupt the stream? Return an error in the stream?
+                for (let p = 0; p < postprocessors.length; p++) {
+                    const processor = postprocessors[p];
+                    const value = helpers.extractHeaderConfig(event.headers, config, processor);
+                    const pResponse = await processor.run(value, req.body, meta, config, stats);
+                    if (pResponse) {
+                        uploadStats(stats);
+                        yield pResponse;
+                        throw new Error(pResponse);
+                    }
+                }
+
                 yield dataStream.body;
             }
         })());
@@ -234,7 +247,7 @@ app.post('/v1/chat/completions', async (req, res) => {
                     helpers.log.error(err)
                     reject(err)
                 })
-                .on('finish', (data) => {
+                .on('finish', async (data) => {
                     res.end()
                     // Calculate the number of tokens used
                     // TODO: Not sure how heavy loading these token mappings are, we should pre-load them
@@ -242,9 +255,12 @@ app.post('/v1/chat/completions', async (req, res) => {
                     meta['usage']['prompt_tokens'] = req.body['messages'].reduce((count, message) => count + tokenEncoder.encode(message.content).length, 0);
                     meta['usage']['completion_tokens'] = tokenEncoder.encode(streamedBody).length
                     meta['usage']['total_tokens'] = meta['usage']['prompt_tokens'] + meta['usage']['completion_tokens']
+                    stats.response = meta;
+                    uploadStats(stats);
+                    resolve();
                 });   
         });
-        
+
         return await processStream;
         
     } else {
@@ -274,9 +290,9 @@ app.post('/v1/chat/completions', async (req, res) => {
             if (pResponse) {
                 await uploadStats(stats);
                 return res.status(response.statusCode)
-                .header(response.headers)
-                .send(response.body)
-                .end();
+                    .header(response.headers)
+                    .send(response.body)
+                    .end();
             }
         }
 
@@ -286,24 +302,50 @@ app.post('/v1/chat/completions', async (req, res) => {
         if (stats.error) {
             const rtnError = helpers.rtnError(422, 'invalid_request', `Usage Panda: ${stats.flags.map(function(f){return f.description}).join(', ')}`);
             stats.response = rtnError.body;
-            return res.status(response.statusCode)
-            .header(response.headers)
-            .send(response.body)
-            .end();
+            return res.send(response.body).end();
         }
 
         helpers.log.debug(`Returning ${response.statusCode} response`);
-        return res.status(response.statusCode)
-            .header(response.headers)
-            .send(JSON.stringify(response.body, null, 4))
-            .end();
+        return res.send(JSON.stringify(response.body, null, 4)).end();
     }
 })
 
 
+
+// // Azure OpenAI does not allow more than one embedding input.
+// // We can simulate it by splitting it into multiple requests, then returing the aggregate.
+// app.post('/v1/embedings', async (req, res) => {
+//     let event = {
+//         headers: req.headers,
+//         requestContext: {
+//             http: {
+//                     method: req.method,
+//                     path: req.url
+//                 },
+//             body: req.body
+//         }
+//     }
+// })
+
+// // Some applications may check available models. We need to simulate if not using OpenAI.
 // app.get('/v1/models', async (req, res) => {
-//     const models = await helpers.getModels();
-//     res.send(models).end();
+//     const {headerError, openAIKey} = helpers.extractHeaders(req);
+//     if (    ) {
+//         return res.status(422)
+//             .send(headerError.body)
+//             .end();
+//     }
+//     const url = 'https://api.openai.com/v1/models';
+//     const models = await helpers.makeLLMRequest('get', url, {headers: {'Authorization': openAIKey}});
+//     if (models.statusCode != 200) {
+//         return res.status(models.statusCode)
+//                 .set(models.headers)
+//                 .send(models.body).end()
+//     }
+//     return res.status(models.statusCode)
+//             .set(models.headers)
+//             .send(JSON.stringify(models.body, null, 2))
+//             .end();
 // })
 
 
